@@ -1,1 +1,6 @@
 network/*
+vortex/results
+vortex/node_modules
+vortex/build
+vortex/cache
+vortex/artifacts
