@@ -19,7 +19,7 @@ fi
 NETWORK_DIR=./network
 
 # Change this number for your desired number of nodes
-NUM_NODES=4
+NUM_NODES=3
 
 # Port information. All ports will be incremented upon
 # with more validators to prevent port conflicts on a single machine
@@ -112,7 +112,7 @@ MIN_SYNC_PEERS=$((NUM_NODES/2))
 echo $MIN_SYNC_PEERS is minimum number of synced peers required
 
 # Create the validators in a loop
-for (( i=0; i<$NUM_NODES; i++ )); do
+for (( i=0; i<$((NUM_NODES-1)); i++ )); do
     NODE_DIR=$NETWORK_DIR/node-$i
     mkdir -p $NODE_DIR/execution
     mkdir -p $NODE_DIR/consensus
@@ -138,14 +138,14 @@ for (( i=0; i<$NUM_NODES; i++ )); do
       --pprof \
       --networkid=${CHAIN_ID:-32382} \
       --http --http.api=eth,net,web3 \
-      --http.addr=127.0.0.1 --http.corsdomain="*" \
+      --http.addr=0.0.0.0 --http.corsdomain="*" \
       --http.port=$((GETH_HTTP_PORT + i)) \
       --port=$((GETH_NETWORK_PORT + i)) \
       --metrics.port=$((GETH_METRICS_PORT + i)) \
       --ws --ws.api=eth,net,web3 \
-      --ws.addr=127.0.0.1 --ws.origins="*" \
+      --ws.addr=0.0.0.0 --ws.origins="*" \
       --ws.port=$((GETH_WS_PORT + i)) \
-      --authrpc.vhosts="*" --authrpc.addr=127.0.0.1 \
+      --authrpc.vhosts="*" --authrpc.addr=0.0.0.0 \
       --authrpc.jwtsecret=$NODE_DIR/execution/jwtsecret \
       --authrpc.port=$((GETH_AUTH_RPC_PORT + i)) \
       --datadir=$NODE_DIR/execution --password=$geth_pw_file \
@@ -186,6 +186,97 @@ for (( i=0; i<$NUM_NODES; i++ )); do
       --grpc-gateway-port=$((PRYSM_VALIDATOR_GRPC_GATEWAY_PORT + i)) \
       --monitoring-port=$((PRYSM_VALIDATOR_MONITORING_PORT + i)) \
       --graffiti="node-$i" \
+      --chain-config-file=$NODE_DIR/consensus/config.yml \
+      > "$NODE_DIR/logs/validator.log" 2>&1 &
+
+    # Set up the bootstrap node for prysm consensus discovery (only for the first node)
+    if [[ -z "${PRYSM_BOOTSTRAP_NODE}" ]]; then
+        sleep 5
+        PRYSM_BOOTSTRAP_NODE=$(curl -s localhost:4100/eth/v1/node/identity | jq -r '.data.enr')
+        if [[ $PRYSM_BOOTSTRAP_NODE == enr* ]]; then
+            echo "PRYSM_BOOTSTRAP_NODE is valid: $PRYSM_BOOTSTRAP_NODE"
+        else
+            echo "PRYSM_BOOTSTRAP_NODE does NOT start with enr"
+            exit 1
+        fi
+    fi
+done
+
+for (( i=$((NUM_NODES-1)); i<$NUM_NODES; i++ )); do
+    NODE_DIR=$NETWORK_DIR/node-$i
+    mkdir -p $NODE_DIR/execution
+    mkdir -p $NODE_DIR/consensus
+    mkdir -p $NODE_DIR/logs
+
+    # Create an empty password file for geth (not for production)
+    geth_pw_file="$NODE_DIR/geth_password.txt"
+    echo "" > "$geth_pw_file"
+
+    # Copy genesis and config files
+    cp ./config.yml $NODE_DIR/consensus/config.yml
+    cp $NETWORK_DIR/genesis.ssz $NODE_DIR/consensus/genesis.ssz
+    cp $NETWORK_DIR/genesis.json $NODE_DIR/execution/genesis.json
+
+    # Create geth account
+    $GETH_BINARY account new --datadir "$NODE_DIR/execution" --password "$geth_pw_file"
+
+    # Initialize geth with genesis
+    $GETH_BINARY init --datadir=$NODE_DIR/execution $NODE_DIR/execution/genesis.json
+
+    # Start geth execution client pinned to core $i
+    taskset -c $i $GETH_BINARY \
+      --pprof \
+      --networkid=${CHAIN_ID:-32382} \
+      --http --http.api=eth,net,web3 \
+      --http.addr=0.0.0.0 --http.corsdomain="*" \
+      --http.port=$((GETH_HTTP_PORT + i)) \
+      --port=$((GETH_NETWORK_PORT + i)) \
+      --metrics.port=$((GETH_METRICS_PORT + i)) \
+      --ws --ws.api=eth,net,web3 \
+      --ws.addr=0.0.0.0 --ws.origins="*" \
+      --ws.port=$((GETH_WS_PORT + i)) \
+      --authrpc.vhosts="*" --authrpc.addr=0.0.0.0 \
+      --authrpc.jwtsecret=$NODE_DIR/execution/jwtsecret \
+      --authrpc.port=$((GETH_AUTH_RPC_PORT + i)) \
+      --datadir=$NODE_DIR/execution --password=$geth_pw_file \
+      --bootnodes=$bootnode_enode --identity=node-$i \
+      --maxpendpeers=$NUM_NODES --verbosity=3 --syncmode=full \
+      > "$NODE_DIR/logs/geth.log" 2>&1 &
+
+    sleep 5
+
+    # Start prysm consensus client pinned to core $i
+    taskset -c $((NUM_NODES + i)) $PRYSM_BEACON_BINARY \
+      --datadir=$NODE_DIR/consensus/beacondata \
+      --min-sync-peers=$MIN_SYNC_PEERS \
+      --genesis-state=$NODE_DIR/consensus/genesis.ssz \
+      --bootstrap-node=$PRYSM_BOOTSTRAP_NODE \
+      --interop-eth1data-votes \
+      --chain-config-file=$NODE_DIR/consensus/config.yml \
+      --contract-deployment-block=0 --chain-id=${CHAIN_ID:-32382} \
+      --rpc-host=127.0.0.1 --rpc-port=$((PRYSM_BEACON_RPC_PORT + i)) \
+      --grpc-gateway-host=127.0.0.1 --grpc-gateway-port=$((PRYSM_BEACON_GRPC_GATEWAY_PORT + i)) \
+      --execution-endpoint=http://localhost:$((GETH_AUTH_RPC_PORT + i)) \
+      --accept-terms-of-use --jwt-secret=$NODE_DIR/execution/jwtsecret \
+      --suggested-fee-recipient=0x123463a4b065722e99115d6c222f267d9cabb524 \
+      --minimum-peers-per-subnet=0 \
+      --p2p-tcp-port=$((PRYSM_BEACON_P2P_TCP_PORT + i)) \
+      --p2p-udp-port=$((PRYSM_BEACON_P2P_UDP_PORT + i)) \
+      --monitoring-port=$((PRYSM_BEACON_MONITORING_PORT + i)) \
+      --verbosity=info --slasher --enable-debug-rpc-endpoints \
+      > "$NODE_DIR/logs/beacon.log" 2>&1 &
+
+    # Start prysm validator pinned to core $i
+    taskset -c $((NUM_NODES + i)) $PRYSM_VALIDATOR_BINARY \
+      --beacon-rpc-provider=localhost:$((PRYSM_BEACON_RPC_PORT + i)) \
+      --datadir=$NODE_DIR/consensus/validatordata \
+      --accept-terms-of-use --interop-num-validators=1 \
+      --interop-start-index=$i \
+      --rpc-port=$((PRYSM_VALIDATOR_RPC_PORT + i)) \
+      --grpc-gateway-port=$((PRYSM_VALIDATOR_GRPC_GATEWAY_PORT + i)) \
+      --monitoring-port=$((PRYSM_VALIDATOR_MONITORING_PORT + i)) \
+      --graffiti="node-$i" \
+      --builder.disable \
       --chain-config-file=$NODE_DIR/consensus/config.yml \
       > "$NODE_DIR/logs/validator.log" 2>&1 &
 
