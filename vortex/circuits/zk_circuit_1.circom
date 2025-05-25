@@ -1,16 +1,15 @@
 pragma circom 2.0.0;
 
-include "circomlib/circuits/comparators.circom";
+template HighGasCircuit(n) {
+    signal input x;
+    signal output out[n];
 
-template Main() {
-    signal input a;
-    signal input b;
-    signal output out;
-
-    component lt = LessThan(8); // 8-bit comparison
-    lt.in[0] <== a;
-    lt.in[1] <== b;
-    out <== lt.out;
+    // Produce n public outputs so that the verifier function will have to process a larger public input array.
+    for (var i = 0; i < n; i++){
+        out[i] <== x + i;
+    }
 }
 
-component main = Main();
+component main = HighGasCircuit(40);
+
+// Gas Cost: 500K

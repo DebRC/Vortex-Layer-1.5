@@ -53,4 +53,6 @@ template ZKProof2(levels) {
     root <== intermediate[levels];
 }
 
-component main = ZKProof2(20);
+component main = ZKProof2(50);
+
+// Gas Cost - 200K
