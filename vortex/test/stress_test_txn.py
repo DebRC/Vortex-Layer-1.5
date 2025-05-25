@@ -1,189 +1,214 @@
-from web3 import Web3
-from random import choice
-from concurrent.futures import ThreadPoolExecutor
-import time
-import csv
-import os
+import os, random
+import json
 import subprocess
-import threading
+from web3 import Web3
+from eth_account import Account
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import csv
 
 from dotenv import load_dotenv
 load_dotenv("../.env")
 
-# Settings
-NUM_CALLS_DICT = {
-    "15M": 3500,
-    "30M": 7000,
-    "45M": 10500,
-    "60M": 14000,
-    "75M": 17500,
-    "90M": 21000,
-    "105M": 24500,
-    "120M": 28000,
-    "135M": 31500,
-    "150M": 35000,
-    "200M": 42000,
-    "250M": 52500,
-    "300M": 63000,
-    "350M": 73500,
-    "400M": 84000,
-    "450M": 94500,
-    "500M": 105000,
-}
-RPC_URL = os.getenv("RPC_URL")
-NUMBER_OF_CALLS = NUM_CALLS_DICT["15M"]
-NODE_IPC_PATH = os.getenv("NODE_IPC_PATH")
-CPU_PROFILE_INTERVAL = int(os.getenv("CPU_PROFILE_INTERVAL"))
-CPU_PROFILE_COUNT = int(os.getenv("CPU_PROFILE_COUNT"))
+PER_TXN_GAS = int(os.getenv("PER_TXN_GAS"))
+ESTIMATED_BLOCKS_TO_MONITOR = int(os.getenv("ESTIMATED_BLOCKS_TO_MONITOR"))
+NUM_TXNS = (int(os.getenv("GAS_LIMIT"))//PER_TXN_GAS)*ESTIMATED_BLOCKS_TO_MONITOR
+PROFILING_NODE_IPC_PATH = os.getenv("PROFILING_NODE_IPC_PATH")
+PROFILING_NODE_LOG = os.getenv("PROFILING_NODE_LOG")
+SLOT_DURATION = int(os.getenv("CPU_PROFILE_INTERVAL"))
 READINGS_DIR = os.getenv("READINGS_DIR")
-os.makedirs(READINGS_DIR, exist_ok=True)
-
-w3 = Web3(Web3.HTTPProvider(RPC_URL))
-if not w3.is_connected():
-    raise Exception("Ethereum node connection failed")
-w3_ipc = Web3(Web3.IPCProvider(NODE_IPC_PATH))
-
-if not w3.is_connected() or not w3_ipc.is_connected():
-    raise Exception("Ethereum node connection failed")
-
-private_keys = [
+RPC_URL = os.getenv("RPC_URL")
+PRIVATE_KEY = [
     os.getenv("PRIVATE_KEY_1"),
     os.getenv("PRIVATE_KEY_2"),
     os.getenv("PRIVATE_KEY_3"),
 ]
+os.makedirs(READINGS_DIR, exist_ok=True)
+DEVNULL = subprocess.DEVNULL
 
-sender_key = choice(private_keys)
-receiver_key = choice(private_keys)
-while sender_key == receiver_key:
-    receiver_key = choice(private_keys)
+w3 = Web3(Web3.HTTPProvider(RPC_URL))
 
-sender_account = w3.eth.account.from_key(sender_key)
-receiver_account = w3.eth.account.from_key(receiver_key)
-nonce_start = w3.eth.get_transaction_count(sender_account.address, "pending")
-
-print(f"Sending {NUMBER_OF_CALLS} txns from {sender_account.address} to {receiver_account.address}")
-
-cpu_profile_files = []
-txn_records = []
+acct1Key = random.choice(PRIVATE_KEY)
+acct2Key = random.choice(PRIVATE_KEY)
+while acct1Key==acct2Key:
+    acct2Key = random.choice(PRIVATE_KEY)
+acct1 = Account.from_key(acct1Key)
+acct2 = Account.from_key(acct2Key)
 
 
-def run_cpu_profiler(profile_id):
-    abs_prof = os.path.abspath(os.path.join(READINGS_DIR, f"cpu_{profile_id}.prof"))
-    cpu_profile_files.append(abs_prof)
-    subprocess.run(["geth", "--exec", f"debug.startCPUProfile('{abs_prof}')", "attach", NODE_IPC_PATH])
-    time.sleep(CPU_PROFILE_INTERVAL)
-    subprocess.run(["geth", "--exec", "debug.stopCPUProfile()", "attach", NODE_IPC_PATH])
+cpu_profile_file = ''
 
-def profiler_scheduler():
-    for i in range(CPU_PROFILE_COUNT):
-        run_cpu_profiler(i)
+def run_command(cmd):
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    if result.returncode != 0:
+        print(f"Error :: {result.stderr}")
+        raise Exception("Command failed")
+    return result.stdout
 
-# Pre-sign all transactions
-# base_fee = w3.eth.get_block("pending").baseFeePerGas
-base_fee = w3.to_wei(10, 'gwei')
-tip = w3.to_wei(2, 'gwei')
-max_fee = int(base_fee) + tip
+def start_cpu_profiling():
+    abs_prof = os.path.abspath(
+        os.path.join(READINGS_DIR, f"cpu.prof")
+    )
+    global cpu_profile_file
+    cpu_profile_file = abs_prof
 
-signed_txns = []
-for i in range(NUMBER_OF_CALLS):
+    subprocess.run([
+        "geth",
+        "--exec", "try { debug.stopCPUProfile(); } catch (e) {}",
+        "attach", PROFILING_NODE_IPC_PATH
+    ], check=False, stdout=DEVNULL, stderr=DEVNULL)
+
+    subprocess.run([
+        "geth",
+        "--exec", f'debug.startCPUProfile("{abs_prof}")',
+        "attach", PROFILING_NODE_IPC_PATH
+    ], check=True, stdout=DEVNULL, stderr=DEVNULL)
+
+def stop_cpu_profiling():
+    subprocess.run([
+        "geth",
+        "--exec", "debug.stopCPUProfile()",
+        "attach", PROFILING_NODE_IPC_PATH
+    ], check=True, stdout=DEVNULL, stderr=DEVNULL)
+
+def sign_txn(nonce):
+    base_fee = w3.to_wei(10, "gwei")
+    tip = w3.to_wei(2, "gwei")
+    max_fee = int(base_fee) + tip
+    transferValue = w3.to_wei(0.1, 'ether')
+    est = w3.eth.estimate_gas({
+        'from': acct1.address,
+        'to': acct2.address,
+        'value': transferValue,
+    })
+    
+    print(f"Estimated Gas for Txn :: {est}, Nonce :: {nonce}")
+
     txn = {
-        'nonce': nonce_start + i,
-        'to': receiver_account.address,
-        'value': w3.to_wei(0.1, 'ether'),
-        'gas': 21000,
+        'nonce': nonce,
+        'to': acct2.address,
+        'value': transferValue,
+        'gas': est,
         'maxFeePerGas': max_fee,
         'maxPriorityFeePerGas': tip,
         'chainId': 32382,
         'type': '0x2'
     }
-    signed = w3.eth.account.sign_transaction(txn, sender_key)
-    signed_txns.append((signed, txn['nonce']))
+    signed_tx = w3.eth.account.sign_transaction(txn, acct1Key)
+    return signed_tx
 
-threading.Thread(target=profiler_scheduler, daemon=True).start()
-start_block = w3.eth.block_number+1
-print(f"Start Block: {start_block}")
-tx_hash_list = []
+def sign_txns(NUM_TXNS):
+    signed_txns = []
+    base_nonce = w3.eth.get_transaction_count(acct1.address, "pending")
+    for i in range(NUM_TXNS):
+        signed_txns.append(sign_txn(base_nonce + i))
+    return signed_txns    
 
-# Burst send all signed txns
-with ThreadPoolExecutor(max_workers=50) as executor:
-    futures = [executor.submit(w3.eth.send_raw_transaction, signed.raw_transaction) for signed, _ in signed_txns]
-    for i, future in enumerate(futures):
-        try:
-            tx_hash = future.result()
-            print(f"Sent: {tx_hash.hex()} Nonce: {signed_txns[i][1]}")
-            tx_hash_list.append((tx_hash.hex(), signed_txns[i][1]))
-        except Exception as e:
-            print(f"Error sending tx {i}: {e}")
-
-print(f"{len(tx_hash_list)} txns sent. Waiting for confirmations...")
-
-for tx_hash, nonce in tx_hash_list:
-    try:
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
-        print(f"Confirmed {tx_hash} in block {receipt.blockNumber}")
-    except:
-        print(f"Timeout or error for tx {tx_hash}")
-
-end_block = w3.eth.block_number
-print(f"End Block: {end_block}")
-
-# CPU usage summary
-cpu_total = 0
-cpu_count = 0
-cpu_usage = []
-for prof_file in cpu_profile_files[1:]:
-    result = subprocess.run(["go", "tool", "pprof", "-top", prof_file], stdout=subprocess.PIPE, text=True)
-    for line in result.stdout.splitlines():
-        if line.strip().startswith("Duration:"):
+def submit_txns(signed_txns):
+    tx_hash_list = []
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        futures = [executor.submit(w3.eth.send_raw_transaction, signed_tx.raw_transaction) for signed_tx in signed_txns]
+        for future in futures:
             try:
-                sec = float(line.strip().split()[5].replace("s", ""))
-                cpu_total += sec
-                cpu_count += 1
-                cpu_usage.append({"profileNumber": str(cpu_count), "CPUUsage(%)": str(sec*100/CPU_PROFILE_INTERVAL)})
-                break
+                tx_hash = future.result()
+                tx_hash_list.append(tx_hash)
+                print(f"Txn Submitted :: 0x{tx_hash.hex()}")
+            except Exception as e:
+                print(f"Error Submitting Txn: {e}")
+    return tx_hash_list
+
+def confirm_txns(tx_hash_list):
+    confirmed_txns=0
+    for tx_hash in tx_hash_list:
+        try:
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+            print(f"Transaction Confirmed :: 0x{tx_hash.hex()}, Gas Used :: {receipt.gasUsed}, Block :: {receipt.blockNumber}")
+            confirmed_txns+=1
+        except Exception as e:
+            print(f"Txn Timeout or Error :: 0x{tx_hash.hex()}\n{e}")
+    print(f"{confirmed_txns} Transactions Confirmed.")
+
+def generate_results(start_block, end_block):
+    total_blocks = end_block - start_block + 1
+    with open(os.path.join(READINGS_DIR, "cpu.gif"), "wb") as out:
+        subprocess.run(
+            ["go", "tool", "pprof", "-gif", cpu_profile_file],
+            stdout=out,
+            check=True
+        )
+    result = subprocess.run(
+        ["go", "tool", "pprof", "-text", cpu_profile_file],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    state_process_evm_time = 0.0
+    for line in result.stdout.splitlines():
+        if "github.com/ethereum/go-ethereum/core.(*StateProcessor).Process" in line:
+            try:
+                parts = line.strip().split()
+                if parts[3][-2:]=='ms':
+                    state_process_evm_time=float(parts[3][:-2])/1000
+                else:
+                    state_process_evm_time=float(parts[3][:-1])
             except:
-                pass
+                print(f"Error parsing CPU profile {cpu_profile_file}")
+    
+    cpu_usage = state_process_evm_time / (total_blocks*SLOT_DURATION)
 
-with open(os.path.join(READINGS_DIR, "cpu_details.csv"), "w", newline='') as f:
-    writer = csv.DictWriter(f, fieldnames=["profileNumber", "CPUUsage(%)"])
-    writer.writeheader()
-    writer.writerows(cpu_usage)   
+    # Block-based TPS + block details
+    block_details = []
+    # Step 1: Fetch all blocks first
+    for blk in range(start_block, end_block + 1):
+        block = w3.eth.get_block(blk, full_transactions=True)
+        tx_count = len(block.transactions)
+        gas_used = block.gasUsed
+        base_fee = block.get("baseFeePerGas", 0)
+        block_details.append(
+            {
+                "blockNumber": blk,
+                "gasUsed": gas_used,
+                "baseFeePerGas": base_fee,
+                "txCount": tx_count,
+            }
+        )
+    # Step 2: Trim leading and trailing 0-tx blocks
+    while block_details and block_details[0]["txCount"] == 0:
+        block_details.pop(0)
+    while block_details and block_details[-1]["txCount"] == 0:
+        block_details.pop()
+    
+    block_gas_total = sum(b["gasUsed"] for b in block_details)
 
-# Block-based TPS + block details
-block_details = []
-# Step 1: Fetch all blocks first
-for blk in range(start_block, end_block + 1):
-    block = w3.eth.get_block(blk, full_transactions=True)
-    tx_count = len(block.transactions)
-    gas_used = block.gasUsed
-    base_fee = block.get("baseFeePerGas", 0)
-    block_details.append({
-        "blockNumber": blk,
-        "gasUsed": gas_used,
-        "baseFeePerGas": base_fee,
-        "txCount": tx_count
-    })
-# Step 2: Trim leading and trailing 0-tx blocks
-while block_details and block_details[0]["txCount"] == 0:
-    block_details.pop(0)
-while block_details and block_details[-1]["txCount"] == 0:
-    block_details.pop()
-# Step 3: Now compute totals only from trimmed list
-block_count = len(block_details)
-block_gas_total = sum(b["gasUsed"] for b in block_details)
-missed_blocks = sum(b["gasUsed"]==0 for b in block_details)
+    with open(os.path.join(READINGS_DIR, "block_details.csv"), "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["blockNumber", "gasUsed", "baseFeePerGas", "txCount"]
+        )
+        writer.writeheader()
+        writer.writerows(block_details)
 
-with open(os.path.join(READINGS_DIR, "block_details.csv"), "w", newline='') as f:
-    writer = csv.DictWriter(f, fieldnames=["blockNumber", "gasUsed", "baseFeePerGas", "txCount"])
-    writer.writeheader()
-    writer.writerows(block_details)
+    block_tps = (
+        block_gas_total / (total_blocks * SLOT_DURATION) if total_blocks > 0 else 0
+    )
+    
+    print("======== FINAL REPORT ========")
+    print(f"Blocks Used: {total_blocks}")
+    print(f"Total Gas in Blocks: {block_gas_total}")
+    print(f"Gas-Based Throughput: {block_tps:.2f}")
+    print(f"Average CPU Usage by Execution Client (%): {cpu_usage*100:.2f}%")
+    print(f"Average CPU Usage by Execution Client (Time): {cpu_usage*SLOT_DURATION:.2f} sec(s) out of {SLOT_DURATION} secs")
+    print("======== END ========")
 
-block_tps = block_gas_total / (block_count*CPU_PROFILE_INTERVAL) if block_count > 0 else 0
-
-print("======== FINAL REPORT ========")
-print(f"Blocks Used: {block_count}")
-print(f"Total Gas in Blocks: {block_gas_total}")
-print(f"Gas-Based TPS: {block_tps:.2f}")
-print(f"Missed Blocks: {missed_blocks}")
-print(f"CPU Average Usage: {((cpu_total / cpu_count)/CPU_PROFILE_INTERVAL)*100:.2f}%" if cpu_count > 0 else "CPU Average Usage: N/A")
-print("======== END ========")
+def main():
+    signed_txns = sign_txns(NUM_TXNS)
+    start_block = w3.eth.block_number + 1
+    start_cpu_profiling()
+    tx_hash_list = submit_txns(signed_txns)
+    confirm_txns(tx_hash_list)
+    stop_cpu_profiling()
+    end_block = w3.eth.block_number
+    generate_results(start_block, end_block)
+    
+if __name__ == "__main__":
+    main()
