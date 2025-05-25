@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -e
 
+BUILD_DIR="build"
+mkdir -p "${BUILD_DIR}"
+
 # ─── Configuration ───────────────────────────────────────────────────────────
-CIRCUIT="zk_circuit_2"
+CIRCUIT="zk_circuit_1"
 PTAU_PREFIX="pot15"
 BUILD_DIR="build"
 CIRCUIT_PATH="circuits/${CIRCUIT}.circom"
