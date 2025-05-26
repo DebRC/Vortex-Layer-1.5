@@ -8,7 +8,6 @@ async function main() {
   const verifierAddress = await verifier.getAddress();
   console.log("Verifier deployed to:", verifierAddress);
 
-  // Deploy VortexStorage contract
   const VortexStorage = await hre.ethers.getContractFactory("VortexStorage");
   const vortex = await VortexStorage.deploy();
   await vortex.waitForDeployment();
